@@ -77,9 +77,9 @@ def _get_provider():
 
 
 def _call_groq(client, prompt: str) -> str:
-    """Call Groq API with llama-3.3-70b-versatile."""
+    """Call Groq API with openai/gpt-oss-120b."""
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[
             {"role": "system", "content": "You must return ONLY valid JSON. No markdown, no code fences, no extra text."},
             {"role": "user", "content": prompt},
