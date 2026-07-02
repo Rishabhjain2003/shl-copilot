@@ -1,13 +1,12 @@
 """
 LLM integration — supports Groq, Gemini Flash, and OpenAI as providers.
 
-Provider selection via environment (checked in order):
-  - GROQ_API_KEY  → Groq (llama-3.3-70b-versatile) — fastest inference
-  - GEMINI_API_KEY → Gemini Flash
-  - OPENAI_API_KEY → OpenAI GPT-4o-mini
+Uses dynamic failover at query time:
+  1. Tries Groq (llama-3.3-70b-versatile) — fastest
+  2. Falls back to Gemini (gemini-2.0-flash)
+  3. Falls back to OpenAI (gpt-4o-mini)
 
-Enforces structured JSON output, retry logic with backoff, and timeout ceiling.
-Falls back to a safe deterministic response on failure.
+Enforces structured JSON output, fast retries on rate limits (0.5s), and timeout ceiling.
 """
 from __future__ import annotations
 
@@ -19,16 +18,18 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-_provider = None  # "groq", "gemini", or "openai"
-_client = None
+# Configured clients
+_groq_client = None
+_gemini_client = None
+_openai_client = None
 
 # Internal timeout ceiling per LLM call
-LLM_TIMEOUT_SECONDS = 20
+LLM_TIMEOUT_SECONDS = 12
 
 
-def _init_provider():
-    """Detect and initialize the LLM provider based on available API keys."""
-    global _provider, _client
+def _init_clients():
+    """Initialize all available LLM clients."""
+    global _groq_client, _gemini_client, _openai_client
 
     groq_key = os.environ.get("GROQ_API_KEY")
     gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
@@ -37,70 +38,69 @@ def _init_provider():
     if groq_key:
         try:
             from groq import Groq
-            _client = Groq(api_key=groq_key)
-            _provider = "groq"
-            logger.info("Initialized Groq provider")
-            return
+            _groq_client = Groq(api_key=groq_key)
+            logger.info("Initialized Groq client")
         except Exception as e:
-            logger.warning(f"Failed to init Groq: {e}")
+            logger.warning(f"Failed to init Groq client: {e}")
 
     if gemini_key:
         try:
             from google import genai
-            _client = genai.Client(api_key=gemini_key)
-            _provider = "gemini"
-            logger.info("Initialized Gemini provider")
-            return
+            _gemini_client = genai.Client(api_key=gemini_key)
+            logger.info("Initialized Gemini client")
         except Exception as e:
-            logger.warning(f"Failed to init Gemini: {e}")
+            logger.warning(f"Failed to init Gemini client: {e}")
 
     if openai_key:
         try:
             import openai
-            _client = openai.OpenAI(api_key=openai_key)
-            _provider = "openai"
-            logger.info("Initialized OpenAI provider")
-            return
+            _openai_client = openai.OpenAI(api_key=openai_key)
+            logger.info("Initialized OpenAI client")
         except Exception as e:
-            logger.warning(f"Failed to init OpenAI: {e}")
-
-    raise EnvironmentError(
-        "No LLM provider configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY."
-    )
+            logger.warning(f"Failed to init OpenAI client: {e}")
 
 
-def _get_provider():
-    """Lazy-initialize and return the provider."""
-    if _provider is None:
-        _init_provider()
-    return _provider, _client
+def _call_groq(prompt: str) -> str:
+    """Call Groq API with llama-3.3-70b-versatile (openai/gpt-oss-120b fallback)."""
+    # Use openai/gpt-oss-120b as specified by user, fallback to llama-3.3-70b-versatile
+    models = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]
+    last_err = None
+
+    for model in models:
+        try:
+            response = _groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You must return ONLY valid JSON. No markdown, no code fences."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=4096,
+                response_format={"type": "json_object"},
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            last_err = e
+            error_str = str(e).lower()
+            if "404" in error_str or "not found" in error_str:
+                logger.warning(f"Groq model {model} not found, trying fallback...")
+                continue
+            raise
+
+    raise last_err
 
 
-def _call_groq(client, prompt: str) -> str:
-    """Call Groq API with openai/gpt-oss-120b."""
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[
-            {"role": "system", "content": "You must return ONLY valid JSON. No markdown, no code fences, no extra text."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=4096,
-        response_format={"type": "json_object"},
-    )
-    return response.choices[0].message.content.strip()
-
-
-def _call_gemini(client, prompt: str) -> str:
+def _call_gemini(prompt: str) -> str:
     """Call Gemini API."""
     from google.genai import types
 
     models = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
-    last_error = None
+    last_err = None
 
     for model in models:
         try:
-            response = client.models.generate_content(
+            response = _gemini_client.models.generate_content(
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -112,19 +112,19 @@ def _call_gemini(client, prompt: str) -> str:
             )
             return response.text.strip()
         except Exception as e:
-            last_error = e
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                logger.warning(f"Rate limited on {model}, trying next...")
+            last_err = e
+            error_str = str(e).lower()
+            if "429" in error_str or "resource_exhausted" in error_str:
+                logger.warning(f"Gemini model {model} rate limited, trying fallback...")
                 continue
             raise
 
-    raise last_error
+    raise last_err
 
 
-def _call_openai(client, prompt: str) -> str:
+def _call_openai(prompt: str) -> str:
     """Call OpenAI API."""
-    response = client.chat.completions.create(
+    response = _openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Return ONLY valid JSON. No markdown, no code fences."},
@@ -133,6 +133,7 @@ def _call_openai(client, prompt: str) -> str:
         temperature=0.2,
         max_tokens=4096,
         response_format={"type": "json_object"},
+        timeout=LLM_TIMEOUT_SECONDS,
     )
     return response.choices[0].message.content.strip()
 
@@ -143,60 +144,69 @@ def call_llm(
     retry_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Call the LLM with a system prompt and user content.
-
-    Returns:
-        Parsed JSON dict from the LLM response.
-        On failure, returns a safe fallback.
+    Call the LLM using dynamic failover across available providers.
     """
-    provider, client = _get_provider()
-    full_prompt = f"{system_prompt}\n\n---\n\n{user_content}"
+    # Lazy-init clients once
+    if _groq_client is None and _gemini_client is None and _openai_client is None:
+        _init_clients()
 
-    for attempt in range(3):
-        try:
-            if attempt > 0:
-                full_prompt = (
-                    f"{system_prompt}\n\n"
-                    "IMPORTANT: Return ONLY a valid JSON object. "
-                    "No markdown, no code fences.\n\n"
-                    f"---\n\n{user_content}"
-                )
+    # Define the execution chain based on configured keys
+    chain = []
+    if _groq_client:
+        chain.append(("groq", _call_groq))
+    if _gemini_client:
+        chain.append(("gemini", _call_gemini))
+    if _openai_client:
+        chain.append(("openai", _call_openai))
 
-            start = time.time()
+    if not chain:
+        logger.error("No LLM clients configured!")
+        return _safe_fallback()
 
-            if provider == "groq":
-                text = _call_groq(client, full_prompt)
-            elif provider == "gemini":
-                text = _call_gemini(client, full_prompt)
-            elif provider == "openai":
-                text = _call_openai(client, full_prompt)
-            else:
-                raise ValueError(f"Unknown provider: {provider}")
+    full_prompt_base = f"{system_prompt}\n\n---\n\n{user_content}"
 
-            elapsed = time.time() - start
-            logger.info(f"LLM [{provider}] attempt {attempt + 1}: {elapsed:.2f}s")
+    for provider, call_fn in chain:
+        for attempt in range(2):  # Max 2 attempts per provider
+            try:
+                prompt = full_prompt_base
+                if attempt > 0:
+                    prompt = (
+                        system_prompt
+                        + "\n\nIMPORTANT: Return ONLY a valid JSON object. No markdown, no code fences."
+                        + f"\n\n---\n\n{user_content}"
+                    )
 
-            result = json.loads(text)
-            return result
+                start = time.time()
+                text = call_fn(prompt)
+                elapsed = time.time() - start
+                logger.info(f"LLM [{provider}] attempt {attempt + 1} succeeded in {elapsed:.2f}s")
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"LLM attempt {attempt + 1} invalid JSON: {e}")
-            if attempt < 2:
-                continue
+                result = json.loads(text)
+                return result
 
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "rate" in error_str.lower():
-                wait_time = min(2 ** attempt * 2, 10)
-                logger.warning(f"Rate limited, attempt {attempt + 1}. Waiting {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"LLM attempt {attempt + 1} failed: {e}")
-                if attempt < 2:
+            except json.JSONDecodeError as e:
+                logger.warning(f"LLM [{provider}] attempt {attempt + 1} returned invalid JSON: {e}")
+                if attempt < 1:
                     continue
 
-    logger.error("All LLM attempts failed — returning safe fallback")
+            except Exception as e:
+                error_str = str(e).lower()
+                logger.warning(f"LLM [{provider}] attempt {attempt + 1} failed: {e}")
+
+                # If rate limited, sleep briefly and try once more before failing over
+                if "429" in error_str or "rate" in error_str or "resource_exhausted" in error_str:
+                    if attempt < 1:
+                        sleep_time = 0.5
+                        logger.warning(f"Rate limit hit on {provider}. Sleeping {sleep_time}s before retry...")
+                        time.sleep(sleep_time)
+                        continue
+
+                # For other errors, or if second attempt failed, break loop to try next provider in chain
+                break
+
+        logger.warning(f"Provider {provider} failed, falling back to next provider in chain...")
+
+    logger.error("All LLM providers in execution chain failed — returning safe fallback")
     return _safe_fallback()
 
 
