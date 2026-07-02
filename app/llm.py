@@ -83,8 +83,14 @@ def _call_groq(prompt: str) -> str:
         except Exception as e:
             last_err = e
             error_str = str(e).lower()
-            if "404" in error_str or "not found" in error_str:
-                logger.warning(f"Groq model {model} not found, trying fallback...")
+            if (
+                "404" in error_str
+                or "not found" in error_str
+                or "429" in error_str
+                or "rate" in error_str
+                or "quota" in error_str
+            ):
+                logger.warning(f"Groq model {model} failed (rate limit or not found), trying fallback...")
                 continue
             raise
 

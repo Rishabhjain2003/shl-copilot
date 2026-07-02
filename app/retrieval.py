@@ -31,18 +31,19 @@ logger = logging.getLogger(__name__)
 ALPHA = 0.6
 TOP_K = 20
 
-# Lazy-loaded embedding model (only needed at query time, not startup)
-_embed_model = None
+# Lazy-loaded Gemini client
+_genai_client = None
 
 
-def _get_embed_model():
-    """Lazy-load the sentence transformer model."""
-    global _embed_model
-    if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("Loaded embedding model for query encoding")
-    return _embed_model
+def _get_genai_client():
+    """Lazy-initialize the Gemini genai client."""
+    global _genai_client
+    if _genai_client is None:
+        import os
+        from google import genai
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
 
 
 @dataclass
@@ -138,11 +139,18 @@ def lexical_score(query: str, filtered_indices: List[int]) -> np.ndarray:
 
 
 def semantic_score(query: str, filtered_indices: List[int]) -> np.ndarray:
-    """Compute embedding cosine similarity for filtered items."""
-    model = _get_embed_model()
+    """Compute embedding cosine similarity for filtered items using Gemini API."""
+    client = _get_genai_client()
     embeddings = catalog.get_embeddings()
 
-    query_emb = model.encode([query], convert_to_numpy=True).astype(np.float32)
+    # Call Gemini API to embed the query
+    resp = client.models.embed_content(
+        model="models/gemini-embedding-2",
+        contents=query,
+    )
+    query_values = resp.embeddings[0].values
+    query_emb = np.array(query_values, dtype=np.float32).reshape(1, -1)
+
     # Normalize
     norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
     if norm > 0:

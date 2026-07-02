@@ -2,24 +2,24 @@
 from __future__ import annotations
 
 """
-Build precomputed embeddings and TF-IDF matrix for the catalog.
+Build precomputed embeddings using Gemini embedding API and TF-IDF matrix for the catalog.
 
 Produces:
-  data/embeddings.npy  — (N, 384) float32 matrix of sentence embeddings
+  data/embeddings.npy  — (N, 3072) float32 matrix of sentence embeddings
   data/tfidf.pkl       — pickled (TfidfVectorizer, sparse matrix) tuple
 
-Run after scripts/scrape.py has produced data/catalog.json.
+Requires GEMINI_API_KEY environment variable.
 """
 
 import json
 import logging
+import os
 import pickle
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ CATALOG_PATH = DATA_DIR / "catalog.json"
 EMBEDDINGS_PATH = DATA_DIR / "embeddings.npy"
 TFIDF_PATH = DATA_DIR / "tfidf.pkl"
 
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "models/gemini-embedding-2"
 
 
 def build_corpus(catalog: list[dict]) -> list[str]:
@@ -55,6 +55,11 @@ def main():
         logger.error(f"Catalog not found at {CATALOG_PATH}. Run scripts/scrape.py first.")
         sys.exit(1)
 
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        logger.error("GEMINI_API_KEY or GOOGLE_API_KEY environment variable must be set to build embeddings.")
+        sys.exit(1)
+
     with open(CATALOG_PATH, "r", encoding="utf-8") as f:
         catalog = json.load(f)
 
@@ -62,13 +67,41 @@ def main():
 
     corpus = build_corpus(catalog)
 
-    # --- Semantic embeddings ---
-    logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    # --- Semantic embeddings via Gemini API ---
+    logger.info(f"Connecting to Gemini API to build embeddings using: {EMBEDDING_MODEL}")
+    from google import genai
+    client = genai.Client(api_key=api_key)
 
-    logger.info("Encoding catalog items...")
-    embeddings = model.encode(corpus, show_progress_bar=True, convert_to_numpy=True)
-    embeddings = embeddings.astype(np.float32)
+    embeddings_list = []
+    logger.info("Calling Gemini embedding API (batch processing in groups of 50)...")
+    batch_size = 50
+    for i in range(0, len(corpus), batch_size):
+        batch = corpus[i : i + batch_size]
+        logger.info(f"Encoding items {i} to {min(i + batch_size, len(corpus))}...")
+        
+        # Delay to avoid hitting rate limits
+        time.sleep(1.5)
+
+        # Retry logic on rate limits
+        for attempt in range(5):
+            try:
+                resp = client.models.embed_content(
+                    model=EMBEDDING_MODEL,
+                    contents=batch,
+                )
+                # Extract vector values
+                for emb in resp.embeddings:
+                    embeddings_list.append(emb.values)
+                break
+            except Exception as e:
+                if attempt < 4 and ("429" in str(e) or "rate" in str(e).lower()):
+                    sleep_time = 16  # Sleep 16s to reset the per-minute quota
+                    logger.warning(f"Rate limited. Waiting {sleep_time}s before retry...")
+                    time.sleep(sleep_time)
+                else:
+                    raise e
+
+    embeddings = np.array(embeddings_list, dtype=np.float32)
 
     # Normalize for cosine similarity (so dot product = cosine sim)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -80,6 +113,7 @@ def main():
 
     # --- TF-IDF ---
     logger.info("Building TF-IDF matrix...")
+    from sklearn.feature_extraction.text import TfidfVectorizer
     vectorizer = TfidfVectorizer(
         max_features=10000,
         stop_words="english",

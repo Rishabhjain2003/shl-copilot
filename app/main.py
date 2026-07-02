@@ -40,12 +40,6 @@ async def lifespan(app: FastAPI):
         logger.error(f"STARTUP FAILURE: {e}")
         raise
 
-    # Eager-load the embedding model so the first /chat call doesn't
-    # pay this cost against the request timeout
-    t0 = time.time()
-    retrieval._get_embed_model()
-    logger.info(f"Startup: embedding model loaded in {time.time() - t0:.2f}s")
-
     yield
 
 
