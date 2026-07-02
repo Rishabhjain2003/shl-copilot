@@ -13,7 +13,7 @@ ENV HF_HOME=/app/.cache
 # avoids a network fetch from HuggingFace Hub on every cold start.
 # Make the cache directory globally readable/writeable for any runtime user.
 RUN mkdir -p /app/.cache && \
-    python -c "from sentence_transformers import Transformer; import os; from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" && \
+    python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" && \
     chmod -R 777 /app/.cache
 
 # Copy application code and data
