@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import catalog
+from app import catalog, retrieval
 from app.models import ChatRequest, ChatResponse
 from app.state import process_chat
 
@@ -39,6 +39,13 @@ async def lifespan(app: FastAPI):
     except FileNotFoundError as e:
         logger.error(f"STARTUP FAILURE: {e}")
         raise
+
+    # Eager-load the embedding model so the first /chat call doesn't
+    # pay this cost against the request timeout
+    t0 = time.time()
+    retrieval._get_embed_model()
+    logger.info(f"Startup: embedding model loaded in {time.time() - t0:.2f}s")
+
     yield
 
 
