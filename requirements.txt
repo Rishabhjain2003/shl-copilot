@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # Core API
 fastapi==0.115.12
 uvicorn[standard]==0.34.3
@@ -7,17 +9,15 @@ pydantic==2.11.3
 google-genai>=1.47.0
 groq>=1.0.0
 
-# Retrieval
+# Retrieval — pin torch CPU-only BEFORE sentence-transformers resolves it,
+# or pip may still pull the CUDA build depending on resolver order
+torch==2.12.1+cpu
 sentence-transformers==3.4.1
 numpy<2.0.0
 scikit-learn==1.5.2
 
 # HTTP client with timeout support
 httpx==0.28.1
-
-# Testing
-pytest==8.3.5
-pytest-asyncio==0.24.0
 
 # Data processing
 requests==2.32.3
