@@ -38,7 +38,7 @@ def _init_clients():
     if groq_key:
         try:
             from groq import Groq
-            _groq_client = Groq(api_key=groq_key)
+            _groq_client = Groq(api_key=groq_key, max_retries=0)
             logger.info("Initialized Groq client")
         except Exception as e:
             logger.warning(f"Failed to init Groq client: {e}")
@@ -54,7 +54,7 @@ def _init_clients():
     if openai_key:
         try:
             import openai
-            _openai_client = openai.OpenAI(api_key=openai_key)
+            _openai_client = openai.OpenAI(api_key=openai_key, max_retries=0)
             logger.info("Initialized OpenAI client")
         except Exception as e:
             logger.warning(f"Failed to init OpenAI client: {e}")
